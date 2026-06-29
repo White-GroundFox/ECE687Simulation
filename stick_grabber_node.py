@@ -9,16 +9,25 @@ from sensor_msgs.msg import JointState
 from robomaster_msgs.action import GripperControl
 import numpy as np
 import math
+import os
+from datetime import datetime
 
 class StickGrabberNode(Node):
     def __init__(self):
         super().__init__('stick_grabber_node')
-        self.get_logger().info("Stick Grabber Node initialized.")
         
         mocap_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             depth=10
         )
+        
+        # --- File Logging Configuration ---
+        self.log_filename = "stick_grabber_log_" + str(self.get_clock().now().to_msg().sec) + ".txt"
+        with open(self.log_filename, "w") as f:
+            f.write(f"--- Debug Logging Session Started: {datetime.now()} ---\n")
+            f.write("Timestamp,Phase,Target_Local_X,Target_Local_Z,Error_X,Error_Z,Error_Norm,Joint_1,Joint_2\n")        
+        
+        self._log_to_file("Stick Grabber Node initialized.")
         
         # --- Constants and Geometry for the Robot ---
         # using the parameter echo: ros2 param get /robot3/robot_state_publisher robot_description
@@ -43,39 +52,61 @@ class StickGrabberNode(Node):
         # 1: MOVE_TO_STICK
         # 2: CLOSE_GRIPPER
         # 3: DONE
-        self._currentPhase = 0
+        self._currentPhase = 1  # Updated to jump straight to Phase 1 tracking if gripper is open
         self._gripper_action_running = False
 
         # --- Subscriptions ---
+        self._log_to_file("Awaiting MoCap stream and telemetry...")
         self.create_subscription(PoseStamped, '/vrpn_mocap/hockey_sticks_1/pose', self.stick_mocap_callback, mocap_qos)  
         self.create_subscription(JointState, '/robot3/joint_states', self.joint_states_callback, mocap_qos)
         self.create_subscription(PoseStamped, '/vrpn_mocap/dji_robot_3/pose', self.robot_pose_callback, mocap_qos)
+        self._log_to_file("Subscriptions to MoCap and JointState topics established.")
 
         # --- Action Clients & Publishers ---
+        self._log_to_file("Initializing gripper action client and arm command publisher...")
         self.cb_group = ReentrantCallbackGroup()
         self.gripper_client = ActionClient(self, GripperControl, '/robot3/gripper', callback_group=self.cb_group)
         self.arm_pub = self.create_publisher(Vector3, '/robot3/cmd_arm', 10)
+        self._log_to_file("Arm command publisher established on /robot3/cmd_arm topic.")
 
-        self.get_logger().info("Connecting to gripper action server...")
+        self._log_to_file("Connecting to gripper action server...")
         if not self.gripper_client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error("Gripper server discovery timed out! Continuing anyway...")
+            self._log_to_file("[ERROR] Gripper server discovery timed out! Continuing anyway...")
+        else:
+            self._log_to_file("Gripper action client connected to server successfully.")
 
         # Control loop execution running at 10Hz
         self.timer = self.create_timer(0.1, self.control_loop)
-        self.get_logger().info("Closed-Loop Feedback Grabber Node online. Awaiting MoCap stream...")
+        self._log_to_file("Closed-Loop Feedback Grabber Node online. Awaiting MoCap stream...")
     
+    def _log_to_file(self, msg, is_matrix_data=False):
+        """Unified logging wrapper that timestamps, saves to disk, and prints to terminal."""
+        try:
+            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            if is_matrix_data:
+                full_line = f"{timestamp},{msg}"
+            else:
+                full_line = f"[{timestamp}] {msg}"
+                # Mirror system/event text back to console out for visibility
+                self.get_logger().info(msg)
+                
+            with open(self.log_filename, "a") as f:
+                f.write(full_line + "\n")
+        except Exception as e:
+            self.get_logger().error(f"Failed to write to log file: {e}")
+
     def _compute_forward_kinematics(self, joints):
         """
         Compute the forward kinematics for the planar manipulator.
+        Assumes independent/absolute servo angles relative to the horizontal frame.
         Returns array [x, z] where x is forward and z is upward.
         """
         theta1, theta2 = joints
-        c1 = math.cos(theta1)
-        c12 = math.cos(theta1 + theta2)
-        s1 = math.sin(theta1)
-        s12 = math.sin(theta1 + theta2)
-        x = self._a1 * c1 + self._a2 * c12
-        z = self._a1 * s1 + self._a2 * s12
+        
+        # Calculate individual link projections independently
+        x = self._a1 * math.cos(theta1) + self._a2 * math.cos(theta2)
+        z = self._a1 * math.sin(theta1) + self._a2 * math.sin(theta2)
+        
         return np.array([x, z])
     
     def robot_pose_callback(self, msg):
@@ -92,45 +123,51 @@ class StickGrabberNode(Node):
             self.get_logger().error("Arm joint names not found in JointState message!", throttle_duration_sec=5.0)
 
     def stick_mocap_callback(self, msg):
-        if self.robot_pose is None:
+        if self.robot_pose is None or self.robot_pose_orientation is None:
             return
-        stick_global = np.array([msg.pose.position.x, msg.pose.position.y])
-        self.desired_pose = self._convert_to_robot_base_coordinates(stick_global)
+        self.desired_pose = self._convert_to_robot_base_coordinates(msg)
+    
+    def _convert_to_robot_base_coordinates(self, global_msg):
+        # 1. Handle horizontal translation error (using global X and Y)
+        translation_error_x = global_msg.pose.position.x - self.robot_pose[0]
+        translation_error_y = global_msg.pose.position.y - self.robot_pose[1]
 
-    def _convert_to_robot_base_coordinates(self, global_pos):
-        translation_error = global_pos - self.robot_pose
-        # Extract robot yaw angle from quaternion
+        # Extract robot yaw angle from quaternion orientation
         q = self.robot_pose_orientation
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
         yaw = math.atan2(siny_cosp, cosy_cosp)
         
-        # Standard 2D coordinate frame rotation matrix projection
-        local_x = translation_error[0] * math.cos(yaw) + translation_error[1] * math.sin(yaw)
-        local_z = -translation_error[0] * math.sin(yaw) + translation_error[1] * math.cos(yaw)
+        # 2. Standard 2D rotation matrix projection onto the robot's heading
+        local_x = translation_error_x * math.cos(yaw) + translation_error_y * math.sin(yaw)
+        # 3. Handle the vertical height target off the ground/base link
+        local_z = global_msg.pose.position.z 
         
         return np.array([local_x, local_z])
 
     def control_loop(self):
         # Lockout control loop until telemetry dependencies exist
         if self.joint_positions is None or self.desired_pose is None:
-            self.get_logger().warn("Awaiting incoming MoCap stream/telemetry updates...", throttle_duration_sec=2.0)
+            self._log_to_file("System Telemetry Blocked: Awaiting stream packets...", is_matrix_data=False)
             return
         
         # --- Phase 0: Ensure Gripper is Completely Open ---
         if self._currentPhase == 0:
             if not self._gripper_action_running:
-                self.get_logger().info("Phase 0: Actuating gripper open sequence.")
+                self._log_to_file("Phase 0 Execution: Requesting gripper open goal.")
                 self._send_gripper_goal(1) # 1 = OPEN
             return
 
         pos_error = self._compute_error_vectors()
         pos_error_norm = np.linalg.norm(pos_error)
         
-        # --- Phase 1: Close-Loop Proportional Tracking to Target ---
+        # Stream CSV line formatting directly to file log matrix for Phase 1 profiling
+        matrix_str = f"{self._currentPhase},{self.desired_pose[0]:.4f},{self.desired_pose[1]:.4f},{pos_error[0]:.4f},{pos_error[1]:.4f},{pos_error_norm:.4f},{self.joint_positions[0]:.4f},{self.joint_positions[1]:.4f}"
+        self._log_to_file(matrix_str, is_matrix_data=True)
+        
         if self._currentPhase == 1:
             if pos_error_norm < self._error_threshold:
-                self.get_logger().info("Phase 1 Complete: Target reached. Braking arm and proceeding to grasp.")
+                self._log_to_file(f"Phase 1 Complete: Target reached (Error: {pos_error_norm:.4f}m). Braking arm joints.")
                 stop_msg = Vector3(x=0.0, y=0.0, z=0.0)
                 self.arm_pub.publish(stop_msg)
                 self._currentPhase = 2
@@ -145,30 +182,21 @@ class StickGrabberNode(Node):
                 
                 msg = Vector3(x=float(cmd_x), y=0.0, z=float(cmd_z))
                 self.arm_pub.publish(msg)
-                
-                self.get_logger().info(
-                    f"Phase 1 Tracking -> Distance Error: {pos_error_norm:.3f}m | "
-                    f"Target Local XZ: [{self.desired_pose[0]:.2f}, {self.desired_pose[1]:.2f}] | "
-                    f"Velocity Vector: [{cmd_x:.2f}, {cmd_z:.2f}]", 
-                    throttle_duration_sec=1.0
-                )
 
-        # --- Phase 2: Close Gripper Around Stick ---
         elif self._currentPhase == 2:
             if not self._gripper_action_running:
-                self.get_logger().info("Phase 2: Actuating gripper close sequence.")
+                self._log_to_file("Phase 2 Execution: Target secured. Requesting gripper close goal.")
                 if not self.gripper_client.wait_for_server(timeout_sec=2.0):
-                    self.get_logger().error("Gripper server lost! Attempting to trigger goal anyway...")
+                    self._log_to_file("[ERROR] Gripper server connectivity dropped! Attempting command pulse anyway...")
                 self._send_gripper_goal(2) # 2 = CLOSE
                 
         # --- Phase 3: Hold Steady Routine Complete ---
         elif self._currentPhase == 3:
             stop_msg = Vector3(x=0.0, y=0.0, z=0.0)
             self.arm_pub.publish(stop_msg)
-            self.get_logger().info("Grasp routine finished. Execution standing by.", throttle_duration_sec=5.0)
             
         else:
-            self.get_logger().error(f"Invalid execution sequence detected: {self._currentPhase}. Resetting.")
+            self._log_to_file(f"[ERROR] Out-of-bounds execution phase index found: {self._currentPhase}. Hard resetting machine state to 0.")
             self._currentPhase = 0
 
     def _send_gripper_goal(self, state_value):
@@ -182,7 +210,7 @@ class StickGrabberNode(Node):
     def _gripper_response_callback(self, future):
         goal_handle = future.result()
         if not goal_handle.accepted:
-            self.get_logger().error("Gripper action goal rejected by hardware driver server.")
+            self._log_to_file("[ERROR] Gripper request handle rejected by low-level firmware architecture.")
             self._gripper_action_running = False
             return
 
@@ -193,10 +221,10 @@ class StickGrabberNode(Node):
         self._gripper_action_running = False  # Clear lock guard
         
         if self._currentPhase == 0:
-            self.get_logger().info("Gripper opened successfully. Progressing to Phase 1: MOVE_TO_STICK")
+            self._log_to_file("Gripper opened successfully. Progressing to Phase 1: MOVE_TO_STICK")
             self._currentPhase = 1
         elif self._currentPhase == 2:
-            self.get_logger().info("Gripper clamped successfully. Progressing to Phase 3: DONE")
+            self._log_to_file("Gripper clamped successfully. Progressing to Phase 3: DONE")
             self._currentPhase = 3
 
     def _compute_error_vectors(self):
@@ -212,11 +240,12 @@ def main(args=None):
     try:
         executor.spin()
     except KeyboardInterrupt:
-        node.get_logger().info("Keyboard Interrupt caught. Halting manipulator joints...")
+        node._log_to_file("Keyboard Interrupt caught. Halting manipulator joints...")
     finally:
         try:
             stop_msg = Vector3(x=0.0, y=0.0, z=0.0)
             node.arm_pub.publish(stop_msg)
+            node._log_to_file("Safety stop brake vectors issued to arm publisher.")
         except Exception as e:
             print(f"Safety stop command failed to publish: {e}")
 
