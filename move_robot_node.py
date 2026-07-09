@@ -2,6 +2,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.signals import SignalHandlerOptions
 import numpy as np
 import math
 from geometry_msgs.msg import PoseStamped, Twist
@@ -123,7 +124,9 @@ class MecanumBaseController(Node):
 
 
 def main(args=None):
-    rclpy.init(args=args)
+    # keep the ROS context alive on Ctrl+C so the safety stop in `finally`
+    # can still publish; rclpy's own SIGINT handler would shut it down first
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     node = MecanumBaseController()
 
     executor = MultiThreadedExecutor()

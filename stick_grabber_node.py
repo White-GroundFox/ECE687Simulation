@@ -4,6 +4,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.action import ActionClient
+from rclpy.signals import SignalHandlerOptions
 from geometry_msgs.msg import Vector3, PoseStamped
 from sensor_msgs.msg import JointState
 from robomaster_msgs.action import GripperControl
@@ -232,7 +233,9 @@ class StickGrabberNode(Node):
         return self.desired_pose - current_ee_pose
 
 def main(args=None):
-    rclpy.init(args=args)
+    # keep the ROS context alive on Ctrl+C so the safety stop in `finally`
+    # can still publish; rclpy's own SIGINT handler would shut it down first
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     node = StickGrabberNode()
 
     executor = MultiThreadedExecutor()
