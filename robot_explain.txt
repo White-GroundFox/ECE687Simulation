@@ -1,0 +1,22 @@
+Done — approach_robot_node.py is in your Windows repo and compiles cleanly. How it works:
+
+Goal pose is recomputed every cycle from robot 6's live mocap pose: stand STANDOFF_DISTANCE away along APPROACH_BEARING_DEG in robot 6's own frame (0° = in front of its gripper), heading turned 180° so robot 3 faces it — gripper to gripper, like your photo. If you later want to approach from the side or behind, just change the bearing (90 = its left, 180 = behind).
+Three phases: NAVIGATE uses the course's approximate linearization — control the point p at l = 0.15 m ahead, then [v, ω] = L⁻¹(l)Rᵀ(θ)ṗ (the Eq. 2–3 from the project PDF); ALIGN rotates in place to the exact final heading (the offset-point method alone doesn't guarantee it); HOLD publishes zeros — and if robot 6 moves, it automatically re-navigates.
+Velocities are clamped (0.5 m/s, 1.5 rad/s) and the Ctrl+C safety stop works (same SignalHandlerOptions fix as your other nodes).
+One flag on your numbers: you asked for a 2 m standoff, but the sim field is only 4×4 m and in your photo robot 3 ends up ~0.6 m from robot 6. With STANDOFF_DISTANCE = 2.0, the goal point will often land outside the walls depending on where robot 6 faces. It's the first constant in the file — try 0.6 if you want the photo's behavior.
+
+To run it (this node needs no fake publisher — robot 6's pose comes from the sim):
+
+Copy it in (second WSL terminal):
+
+sudo docker cp /mnt/c/Users/guanf/Repositories/ece687_robot/approach_robot_node.py dji_robomaster_ros:/ros_ws/src/trial_1/trial_1/
+Inside the container, add a line to entry_points in /ros_ws/src/trial_1/setup.py (via vim):
+
+'approach_robot_node = trial_1.approach_robot_node:main',
+Rebuild (required — setup.py changed) and run:
+
+cd /ros_ws
+colcon build --packages-select trial_1 --symlink-install
+source install/setup.bash
+ros2 run trial_1 approach_robot_node
+In the sim window you should see robot 3 curve toward robot 6's front, stop at the standoff distance, then pivot to face it. A fun verification of the HOLD re-engage logic: in a third shell, nudge robot 6 with ros2 topic pub -1 /robot6/cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.3}}" and watch robot 3 chase the new standoff pose.
